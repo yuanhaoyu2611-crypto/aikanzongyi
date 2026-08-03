@@ -7,11 +7,7 @@ const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=
 const OPENCLI_TIMEOUT_MS = 6000;
 const PAGE_FETCH_TIMEOUT_MS = 9000;
 const MAX_CRAWL_RESULTS = 6;
-const OPENAI_SEARCH_MODEL = process.env.OPENAI_SEARCH_MODEL || 'gpt-5.6-terra';
-const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 15000);
-const AI_CACHE_TTL_MS = Number(process.env.AI_CACHE_TTL_MS || 12 * 60 * 60 * 1000);
 const FALLBACK_SEARCH_TIMEOUT_MS = 4000;
-const aiSearchCache = new Map();
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
   if (req.method === 'OPTIONS') {
@@ -49,15 +45,13 @@ async function handleSearch(url, res) {
       sendJson(res, 200, {
         results: verifiedResults,
         meta: {
-          ai: { ok: true, configured: Boolean(process.env.OPENAI_API_KEY), cached: true, message: '已命中官方核验缓存' },
           crawler: { ok: true, message: `搜索耗时 ${Date.now() - startedAt}ms` },
         },
       });
       return;
     }
 
-    const [ai, tencentApi, directA] = await Promise.all([
-      safeOpenAISearch(query),
+    const [tencentApi, directA] = await Promise.all([
       safeSearch(() => searchTencentVideo(query)),
       safeSearch(() => directSourceResults(query)),
     ]);
@@ -65,20 +59,19 @@ async function handleSearch(url, res) {
       (result) => result.confidence >= 75 && result.parsed?.schedule?.every((slot) => slot.time),
     );
     let fallbackResults = [];
-    if (!ai.results.length && !hasReliablePlatformResult) {
+    if (!hasReliablePlatformResult) {
       fallbackResults = await fastFallbackResults(query);
     }
 
     const candidates = prioritizeResults(
       query,
-      dedupeResults([...ai.results, ...tencentApi, ...fallbackResults, ...directA]),
+      dedupeResults([...tencentApi, ...fallbackResults, ...directA]),
     ).slice(0, 12);
     const enrichedResults = candidates.map((result) => enrichFromSnippet(query, result));
 
     sendJson(res, 200, {
       results: enrichedResults,
       meta: {
-        ai: ai.meta,
         crawler: {
           ok: true,
           message: `搜索耗时 ${Date.now() - startedAt}ms`,
@@ -153,238 +146,6 @@ async function safeSearch(searcher) {
   } catch {
     return [];
   }
-}
-
-async function safeOpenAISearch(query) {
-  if (!process.env.OPENAI_API_KEY) {
-    return {
-      results: [],
-      meta: { ok: false, configured: false, message: '未配置 AI 搜索，已使用快速平台搜索' },
-    };
-  }
-
-  const cacheKey = normalizeSearchText(query);
-  const cached = aiSearchCache.get(cacheKey);
-  if (cached && Date.now() - cached.createdAt < AI_CACHE_TTL_MS) {
-    return {
-      results: cached.results,
-      meta: { ok: true, configured: true, cached: true, message: 'AI 核验结果来自缓存' },
-    };
-  }
-
-  try {
-    const results = await searchOpenAI(query);
-    aiSearchCache.set(cacheKey, { createdAt: Date.now(), results });
-    return {
-      results,
-      meta: {
-        ok: true,
-        configured: true,
-        cached: false,
-        model: OPENAI_SEARCH_MODEL,
-        message: results.length ? `AI 已联网核验 ${results.length} 个更新方案` : 'AI 未找到足够可靠的正片更新计划',
-      },
-    };
-  } catch (error) {
-    return {
-      results: [],
-      meta: {
-        ok: false,
-        configured: true,
-        message: `AI 搜索暂不可用：${friendlyOpenAIError(error)}`,
-      },
-    };
-  }
-}
-
-async function searchOpenAI(query) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
-  try {
-    const response = await fetch('https://api.openai.com/v1/responses', {
-      method: 'POST',
-      signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: OPENAI_SEARCH_MODEL,
-        tools: [{ type: 'web_search' }],
-        reasoning: { effort: 'low' },
-        store: false,
-        input: openAISearchPrompt(query),
-        text: {
-          verbosity: 'low',
-          format: {
-            type: 'json_schema',
-            name: 'variety_show_schedules',
-            strict: true,
-            schema: openAISearchSchema(),
-          },
-        },
-      }),
-    });
-
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`OpenAI ${response.status}: ${body.slice(0, 240)}`);
-    }
-
-    const data = await response.json();
-    const outputText = extractOpenAIOutputText(data);
-    if (!outputText) throw new Error('OpenAI response did not contain structured output');
-    const payload = JSON.parse(outputText);
-    return (payload.results || []).map(aiShowToResult).filter(Boolean);
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function openAISearchPrompt(query) {
-  const today = new Intl.DateTimeFormat('zh-CN', {
-    timeZone: 'Asia/Shanghai',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(new Date());
-  return `你是中国综艺追更日历的数据核验员。今天是 ${today}（Asia/Shanghai）。请联网搜索“${query}”当前或最近一季的正片更新计划。
-
-硬性要求：
-1. 必须实际使用 web_search，优先节目官微、播出平台官方页面或官方账号；百科和新闻只能辅助交叉验证。
-2. 只提取正片，排除预告、花絮、加更、先导片、纯享、直播、会员版衍生内容。
-3. 精确区分节目季数、首播日期、星期、北京时间和平台。不得把网页发布时间当成节目更新时间。
-4. 如果 SVIP、VIP、免费用户日程不同，返回不同方案并在 audience 中写清楚；默认把最早可观看的官方会员方案放在第一条。
-5. 一周多更时，schedule 必须完整列出每个正片更新时间；上下半期属于同一期时分别标注“上半期”“下半期”。
-6. 没有可靠证据的时间不得猜测，找不到精确时刻就不要返回该方案。每个方案至少包含一个可点击来源，confidence 低于 75 不要返回。
-7. totalEpisodes 代表完整正片期数；若官方未公布，可根据已发布正片谨慎估计，但 evidenceSummary 必须说明。`;
-}
-
-function openAISearchSchema() {
-  return {
-    type: 'object',
-    additionalProperties: false,
-    required: ['results'],
-    properties: {
-      results: {
-        type: 'array',
-        maxItems: 4,
-        items: {
-          type: 'object',
-          additionalProperties: false,
-          required: ['title', 'season', 'mediaType', 'audience', 'platforms', 'startDate', 'schedule', 'totalEpisodes', 'firstEpisode', 'confidence', 'evidenceSummary', 'sources'],
-          properties: {
-            title: { type: 'string' },
-            season: { type: 'string' },
-            mediaType: { type: 'string', enum: ['variety', 'drama'] },
-            audience: { type: 'string' },
-            platforms: { type: 'array', minItems: 1, items: { type: 'string' } },
-            startDate: { type: 'string', pattern: '^20\\d{2}-\\d{2}-\\d{2}$' },
-            schedule: {
-              type: 'array',
-              minItems: 1,
-              maxItems: 7,
-              items: {
-                type: 'object',
-                additionalProperties: false,
-                required: ['weekday', 'time', 'partLabel'],
-                properties: {
-                  weekday: { type: 'integer', minimum: 0, maximum: 6 },
-                  time: { type: 'string', pattern: '^(?:[01]\\d|2[0-3]):[0-5]\\d$' },
-                  partLabel: { type: 'string' },
-                },
-              },
-            },
-            totalEpisodes: { type: 'integer', minimum: 1, maximum: 200 },
-            firstEpisode: { type: 'integer', minimum: 1, maximum: 200 },
-            confidence: { type: 'integer', minimum: 75, maximum: 100 },
-            evidenceSummary: { type: 'string' },
-            sources: {
-              type: 'array',
-              minItems: 1,
-              maxItems: 5,
-              items: {
-                type: 'object',
-                additionalProperties: false,
-                required: ['title', 'url'],
-                properties: {
-                  title: { type: 'string' },
-                  url: { type: 'string' },
-                },
-              },
-            },
-          },
-        },
-      },
-    },
-  };
-}
-
-function extractOpenAIOutputText(data) {
-  if (typeof data.output_text === 'string') return data.output_text;
-  return (data.output || [])
-    .filter((item) => item.type === 'message')
-    .flatMap((item) => item.content || [])
-    .filter((item) => item.type === 'output_text')
-    .map((item) => item.text || '')
-    .join('');
-}
-
-function aiShowToResult(show) {
-  const schedule = (show.schedule || [])
-    .map((slot) => ({
-      weekday: Number(slot.weekday),
-      time: /^([01]\d|2[0-3]):[0-5]\d$/.test(slot.time || '') ? slot.time : '',
-      partLabel: cleanText(slot.partLabel || '正片'),
-      startDate: firstDateForWeekday(show.startDate, Number(slot.weekday)),
-    }))
-    .filter((slot) => Number.isInteger(slot.weekday) && slot.time);
-  const sources = (show.sources || [])
-    .map((source) => ({ title: cleanText(source.title || '来源'), url: String(source.url || '') }))
-    .filter((source) => /^https?:\/\//i.test(source.url));
-  if (!show.title || !show.startDate || !schedule.length || !sources.length || Number(show.confidence) < 75) return null;
-
-  const platforms = uniqueNonEmpty(show.platforms || []);
-  const parsed = {
-    title: cleanText(show.title),
-    mediaType: show.mediaType === 'drama' ? 'drama' : 'variety',
-    season: cleanText(show.season || ''),
-    audience: cleanText(show.audience || ''),
-    platform: platforms.join(' / '),
-    platforms,
-    startDate: show.startDate,
-    time: schedule[0].time,
-    schedule,
-    totalEpisodes: Number(show.totalEpisodes || 12),
-    firstEpisode: Number(show.firstEpisode || 1),
-    weekday: schedule[0].weekday,
-    sources,
-  };
-  return {
-    title: [parsed.title, parsed.season, parsed.audience].filter(Boolean).join(' · '),
-    url: sources[0].url,
-    snippet: cleanText(show.evidenceSummary || ''),
-    source: `AI 联网核验 · ${platforms.join(' / ')}`,
-    sources,
-    sourceExcerpt: cleanText(show.evidenceSummary || ''),
-    crawled: true,
-    verifiedByAi: true,
-    confidence: Number(show.confidence),
-    parsed,
-  };
-}
-
-function firstDateForWeekday(startDate, weekday) {
-  const anchorWeekday = new Date(`${startDate}T00:00:00`).getDay();
-  return addDaysKey(startDate, (weekday - anchorWeekday + 7) % 7);
-}
-
-function friendlyOpenAIError(error) {
-  if (error?.name === 'AbortError') return '请求超时，已切换到平台搜索';
-  const message = String(error?.message || error || '未知错误');
-  if (/401|invalid.*key|authentication/i.test(message)) return 'API Key 无效';
-  if (/429|rate limit|quota/i.test(message)) return '额度不足或请求过于频繁';
-  return '请求失败，已切换到平台搜索';
 }
 
 async function safeOpenCliSearch(query) {
