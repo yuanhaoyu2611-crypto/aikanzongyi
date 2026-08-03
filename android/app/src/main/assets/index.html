@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f7f4ee" />
+    <title>爱看综艺</title>
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="stylesheet" href="./styles.css?v=13" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">爱看综艺</p>
+          <h1 id="pageTitle">更新日历</h1>
+        </div>
+        <button class="icon-button" id="todayButton" type="button" aria-label="回到今天" title="回到今天">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M8 2v4M16 2v4M3 10h18M5 4h14a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z" />
+          </svg>
+        </button>
+      </header>
+
+      <main>
+        <section class="page is-active" id="calendarPage" data-title="更新日历">
+          <div class="calendar-toolbar">
+            <div class="month-switcher">
+              <button class="icon-button" id="prevPeriod" type="button" aria-label="上一段时间" title="上一段时间">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg>
+              </button>
+              <strong id="currentPeriodLabel"></strong>
+              <button class="icon-button" id="nextPeriod" type="button" aria-label="下一段时间" title="下一段时间">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
+              </button>
+            </div>
+            <div class="segmented" role="tablist" aria-label="日历视图">
+              <button class="is-active" data-view="week" type="button">周</button>
+              <button data-view="month" type="button">月</button>
+            </div>
+          </div>
+          <div class="weekday-row" aria-hidden="true">
+            <span>周一</span><span>周二</span><span>周三</span><span>周四</span><span>周五</span><span>周六</span><span>周日</span>
+          </div>
+          <div class="calendar-grid" id="calendarGrid"></div>
+        </section>
+
+        <section class="page" id="searchPage" data-title="添加综艺">
+          <form class="search-box" id="searchForm">
+            <label for="searchInput">搜索综艺</label>
+            <div class="search-row">
+              <input id="searchInput" name="query" type="search" placeholder="输入综艺名或季数" autocomplete="off" />
+              <button class="primary-button compact" type="submit">搜索</button>
+            </div>
+          </form>
+          <div class="web-actions" id="webActions" hidden>
+            <a id="baiduLink" target="_blank" rel="noreferrer">百度更新计划</a>
+            <a id="bingLink" target="_blank" rel="noreferrer">Bing 更新计划</a>
+            <a id="xhsLink" target="_blank" rel="noreferrer">小红书笔记</a>
+          </div>
+          <p class="search-status" id="searchStatus"></p>
+          <div class="result-list" id="resultList"></div>
+
+          <details class="manual-panel">
+            <summary>手动添加更新计划</summary>
+            <div class="recognize-box">
+              <label>
+                粘贴更新计划
+                <textarea id="scheduleText" placeholder="例如：快乐再出发第 3 季，6 月 20 日起每周六 12:00 更新，共 12 期"></textarea>
+              </label>
+              <button class="ghost-button" id="recognizePlan" type="button">识别并预填</button>
+            </div>
+            <form class="manual-form" id="manualForm">
+              <label>
+                综艺名
+                <input name="title" required placeholder="例如：快乐再出发" />
+              </label>
+              <label>
+                类型
+                <select name="mediaType" required>
+                  <option value="variety">综艺</option>
+                  <option value="drama">电视剧</option>
+                </select>
+              </label>
+              <label>
+                季数/版本
+                <input name="season" placeholder="例如：第 3 季" />
+              </label>
+              <label>
+                平台
+                <input name="platform" placeholder="例如：浙江卫视 / 腾讯视频 / Z视介" />
+              </label>
+              <div class="form-grid">
+                <label>
+                  首更日期
+                  <input name="startDate" type="date" required />
+                </label>
+                <label>
+                  更新时间
+                  <input name="time" type="time" value="20:00" required />
+                </label>
+              </div>
+              <label>
+                本次内容
+                <input name="partLabel" placeholder="例如：上半期 / 正片 / 加更" />
+              </label>
+              <div class="form-grid">
+                <label>
+                  总期数
+                  <input name="totalEpisodes" type="number" min="1" value="12" required />
+                </label>
+                <label>
+                  首期期数
+                  <input name="firstEpisode" type="number" min="1" value="1" required />
+                </label>
+              </div>
+              <label>
+                更新星期
+                <select name="weekday" required>
+                  <option value="1">每周一</option>
+                  <option value="2">每周二</option>
+                  <option value="3">每周三</option>
+                  <option value="4">每周四</option>
+                  <option value="5">每周五</option>
+                  <option value="6">每周六</option>
+                  <option value="0">每周日</option>
+                </select>
+              </label>
+              <div class="second-schedule">
+                <label class="checkbox-row">
+                  <input name="secondEnabled" type="checkbox" />
+                  还有第二个更新时间
+                </label>
+                <div class="form-grid">
+                  <label>
+                    第二更新星期
+                    <select name="secondWeekday">
+                      <option value="6">每周六</option>
+                      <option value="0">每周日</option>
+                      <option value="1">每周一</option>
+                      <option value="2">每周二</option>
+                      <option value="3">每周三</option>
+                      <option value="4">每周四</option>
+                      <option value="5">每周五</option>
+                    </select>
+                  </label>
+                  <label>
+                    第二更新时间
+                    <input name="secondTime" type="time" value="20:00" />
+                  </label>
+                </div>
+                <label>
+                  第二次内容
+                  <input name="secondPartLabel" placeholder="例如：下半期 / 衍生 / 加更" />
+                </label>
+              </div>
+              <button class="primary-button" type="submit">加入日历</button>
+            </form>
+          </details>
+        </section>
+
+        <section class="page" id="libraryPage" data-title="综艺收藏夹">
+          <div class="status-tabs" role="tablist" aria-label="观看状态">
+            <button class="is-active" data-status="watching" type="button">观看中</button>
+            <button data-status="finished" type="button">已看完</button>
+            <button data-status="dropped" type="button">弃坑</button>
+          </div>
+          <div class="library-list" id="libraryList"></div>
+        </section>
+      </main>
+
+      <nav class="bottom-nav" aria-label="主要页面">
+        <button class="is-active" data-page="calendarPage" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M8 2v4M16 2v4M3 10h18M5 4h14a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z" />
+          </svg>
+          日历
+        </button>
+        <button data-page="searchPage" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="m21 21-4.3-4.3M10.5 18a7.5 7.5 0 1 1 0-15 7.5 7.5 0 0 1 0 15Z" />
+          </svg>
+          添加
+        </button>
+        <button data-page="libraryPage" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 19.5V5a2 2 0 0 1 2-2h13v18H6a2 2 0 0 1-2-1.5ZM8 7h7M8 11h7" />
+          </svg>
+          收藏
+        </button>
+      </nav>
+    </div>
+
+    <template id="emptyStateTemplate">
+      <div class="empty-state">
+        <strong></strong>
+        <p></p>
+      </div>
+    </template>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="./app.js?v=13" defer></script>
+  </body>
+</html>

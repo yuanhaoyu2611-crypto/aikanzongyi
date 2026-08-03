@@ -1,0 +1,28 @@
+apply plugin: "com.android.application"
+
+android {
+    namespace "com.aikanzongyi.app"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.aikanzongyi.app"
+        minSdk 23
+        targetSdk 35
+        versionCode 1
+        versionName "1.0"
+    }
+}
+
+tasks.register("syncWebAssets", Copy) {
+    from(rootProject.projectDir.parentFile) {
+        include "index.html"
+        include "styles.css"
+        include "app.js"
+        include "manifest.webmanifest"
+        include "icon.svg"
+        include "service-worker.js"
+    }
+    into(layout.projectDirectory.dir("src/main/assets"))
+}
+
+preBuild.dependsOn("syncWebAssets")
