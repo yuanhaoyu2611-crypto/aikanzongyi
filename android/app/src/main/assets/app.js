@@ -92,6 +92,12 @@ const els = {
   libraryList: document.querySelector("#libraryList"),
   toast: document.querySelector("#toast"),
   emptyStateTemplate: document.querySelector("#emptyStateTemplate"),
+  dayDetailModal: document.querySelector("#dayDetailModal"),
+  dayModalTitle: document.querySelector("#dayModalTitle"),
+  dayModalWeekday: document.querySelector("#dayModalWeekday"),
+  dayModalSummary: document.querySelector("#dayModalSummary"),
+  dayEventList: document.querySelector("#dayEventList"),
+  dayModalClose: document.querySelector(".modal-close"),
 };
 
 seedFirstRun();
@@ -106,6 +112,19 @@ function bindEvents() {
 
   els.prevPeriod.addEventListener("click", () => shiftPeriod(-1));
   els.nextPeriod.addEventListener("click", () => shiftPeriod(1));
+
+  els.calendarGrid.addEventListener("click", (event) => {
+    const cell = event.target.closest("[data-date-key]");
+    if (cell) openDayDetail(parseDate(cell.dataset.dateKey));
+  });
+
+  els.dayDetailModal.addEventListener("click", (event) => {
+    if (event.target.closest("[data-close-day-modal]")) closeDayDetail();
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !els.dayDetailModal.hidden) closeDayDetail();
+  });
 
   els.viewButtons.forEach((button) => {
     button.addEventListener("click", () => {
@@ -221,6 +240,8 @@ function render() {
 }
 
 function syncActiveButtons() {
+  els.todayButton.hidden = state.activePage !== "calendarPage";
+
   els.pages.forEach((page) => {
     page.classList.toggle("is-active", page.id === state.activePage);
     if (page.id === state.activePage) els.pageTitle.textContent = page.dataset.title;
@@ -250,29 +271,93 @@ function renderCalendar() {
     ...dates.map((date) => {
       const dateKey = toDateKey(date);
       const events = eventsForDate(date);
-      const cell = document.createElement("article");
+      const cell = document.createElement("button");
+      cell.type = "button";
       cell.className = "day-cell";
+      cell.dataset.dateKey = dateKey;
+      cell.setAttribute("aria-label", `${monthDayLabel(date)}，${events.length ? `${events.length}档节目` : "暂无更新"}`);
       cell.classList.toggle("is-today", dateKey === todayKey);
       cell.classList.toggle("is-outside", state.view === "month" && date.getMonth() !== cursorMonth);
+      cell.classList.toggle("has-events", events.length > 0);
+      cell.classList.toggle("is-weekend", date.getDay() === 0 || date.getDay() === 6);
 
       const number = document.createElement("div");
       number.className = "day-number";
-      number.innerHTML = `<span>${dayCellLabel(date)}</span>${dateKey === todayKey ? '<span class="today-pill">今天</span>' : ""}`;
+      number.innerHTML = `<span class="day-number-value">${dayCellLabel(date)}</span>${dateKey === todayKey ? '<span class="today-pill">今天</span>' : ""}`;
       cell.append(number);
 
-      events.forEach((item) => {
+      const visibleEvents = state.view === "month" ? events.slice(0, 2) : events;
+      visibleEvents.forEach((item) => {
         const chip = document.createElement("div");
         chip.className = "episode-chip";
-        chip.innerHTML = `
-          <span class="episode-title">${escapeHtml(item.title)}</span>
-          <span class="episode-meta">${escapeHtml(item.time)} · 第 ${item.episode} ${episodeUnit(item)}${item.partLabel ? ` · ${escapeHtml(item.partLabel)}` : ""}${item.audience ? ` · ${escapeHtml(item.audience)}` : ""} · ${escapeHtml(platformLabel(item) || "未填写平台")}</span>
-        `;
+        chip.innerHTML = state.view === "month"
+          ? `<span class="episode-title">${escapeHtml(item.title)}</span>`
+          : `
+              <span class="episode-title">${escapeHtml(item.title)}</span>
+              <span class="episode-meta">${escapeHtml(item.time)} · 第 ${item.episode} ${episodeUnit(item)}${item.partLabel ? ` · ${escapeHtml(item.partLabel)}` : ""}${item.audience ? ` · ${escapeHtml(item.audience)}` : ""} · ${escapeHtml(platformLabel(item) || "未填写平台")}</span>
+            `;
         cell.append(chip);
       });
+
+      if (state.view === "month" && events.length > visibleEvents.length) {
+        const more = document.createElement("span");
+        more.className = "day-more-count";
+        more.textContent = `还有 ${events.length - visibleEvents.length} 档`;
+        cell.append(more);
+      }
 
       return cell;
     }),
   );
+}
+
+function openDayDetail(date) {
+  const events = eventsForDate(date);
+  els.dayModalTitle.textContent = monthDayLabel(date);
+  els.dayModalWeekday.textContent = `${date.getFullYear()}年 · ${weekdayName(date.getDay())}`;
+  els.dayModalSummary.textContent = events.length ? `${events.length} 档节目将在这一天更新` : "这一天暂无节目更新";
+
+  if (!events.length) {
+    const empty = document.createElement("div");
+    empty.className = "day-modal-empty";
+    empty.innerHTML = "<strong>空闲的一天</strong><p>添加节目后，更新时间会出现在这里。</p>";
+    els.dayEventList.replaceChildren(empty);
+  } else {
+    els.dayEventList.replaceChildren(...events.map(renderDayEvent));
+  }
+
+  els.dayDetailModal.hidden = false;
+  document.body.classList.add("modal-open");
+  requestAnimationFrame(() => els.dayDetailModal.classList.add("is-open"));
+  els.dayModalClose.focus();
+}
+
+function closeDayDetail() {
+  els.dayDetailModal.classList.remove("is-open");
+  document.body.classList.remove("modal-open");
+  window.setTimeout(() => {
+    els.dayDetailModal.hidden = true;
+  }, 180);
+}
+
+function renderDayEvent(item) {
+  const event = document.createElement("article");
+  event.className = "day-event";
+  event.innerHTML = `
+    <div class="day-event-time">${escapeHtml(item.time)}</div>
+    <div class="day-event-content">
+      <div class="day-event-heading">
+        <h3>${escapeHtml(item.title)}</h3>
+        <span>${escapeHtml(item.season || "当前季")}</span>
+      </div>
+      <p>第 ${item.episode} ${episodeUnit(item)}${item.partLabel ? ` · ${escapeHtml(item.partLabel)}` : ""}${item.audience ? ` · ${escapeHtml(item.audience)}` : ""}</p>
+      <div class="platform-line">
+        <span>播放平台</span>
+        <strong>${escapeHtml(platformLabel(item) || "未填写平台")}</strong>
+      </div>
+    </div>
+  `;
+  return event;
 }
 
 async function renderSearchResults(query) {
@@ -353,6 +438,10 @@ function dayCellLabel(date) {
     return `${weekdayName(date.getDay())} ${date.getMonth() + 1}/${date.getDate()}`;
   }
   return date.getDate();
+}
+
+function monthDayLabel(date) {
+  return `${date.getMonth() + 1}月${date.getDate()}日`;
 }
 
 function searchUnavailableText() {

@@ -1,4 +1,4 @@
-const CACHE_NAME = "aikanzongyi-v13";
+const CACHE_NAME = "aikanzongyi-v14";
 const APP_ASSETS = [
   "./",
   "./index.html",
