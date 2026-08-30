@@ -10,6 +10,9 @@ const MAX_CRAWL_RESULTS = 6;
 const FALLBACK_SEARCH_TIMEOUT_MS = 4000;
 const IQIYI_ATTEMPT_TIMEOUT_MS = 2800;
 const IQIYI_SEARCH_TIMEOUT_MS = 6000;
+const TENCENT_ATTEMPT_TIMEOUT_MS = 3000;
+const TENCENT_SEARCH_TIMEOUT_MS = 6500;
+const TENCENT_DEFAULT_TIME = '12:00';
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
   if (req.method === 'OPTIONS') {
@@ -54,7 +57,7 @@ async function handleSearch(url, res) {
     }
 
     const [tencentApi, iqiyiApi, directA] = await Promise.all([
-      safeSearch(() => searchTencentVideo(query)),
+      safeSearch(() => searchTencentVideo(query), TENCENT_SEARCH_TIMEOUT_MS),
       safeSearch(() => searchIqiyi(query), IQIYI_SEARCH_TIMEOUT_MS),
       safeSearch(() => directSourceResults(query)),
     ]);
@@ -541,37 +544,116 @@ function verifiedIqiyiFallbackResults(query) {
 
 async function searchTencentVideo(query) {
   const apiUrl = 'https://pbaccess.video.qq.com/trpc.videosearch.mobile_search.MultiTerminalSearch/MbSearch?vversion_platform=2';
+  const itemGroups = await Promise.all(
+    tencentQueryVariants(query).map((searchQuery) => fetchTencentSearchItems(apiUrl, query, searchQuery).catch(() => [])),
+  );
+  const programs = [];
+  const seenPrograms = new Set();
+  for (const item of itemGroups.flat()) {
+    const info = item.videoInfo || {};
+    if (!isTencentProgramAlbum(query, info)) continue;
+    const key = `${normalizeTencentTitle(info.title)}-${info.year || ''}`;
+    if (seenPrograms.has(key)) continue;
+    seenPrograms.add(key);
+    programs.push(item);
+  }
+
+  return programs
+    .map((item) => tencentResultFromItem(query, item))
+    .filter(Boolean)
+    .sort((a, b) => b.confidence - a.confidence)
+    .slice(0, 4);
+}
+
+async function fetchTencentSearchItems(apiUrl, originalQuery, searchQuery) {
   const body = {
-    query,
+    query: searchQuery,
     pagenum: 0,
-    pagesize: 10,
+    pagesize: 20,
     queryFrom: 0,
-    version: '26060108',
-    clientType: 0,
+    version: '26022601',
+    clientType: 1,
     filterValue: '',
     uuid: `aikanzongyi-${Date.now()}`,
     retry: 0,
-    featureList: [],
+    featureList: ['DEFAULT_FEFEATURE', 'PC_SHORT_VIDEOS_WATERFALL', 'PC_WANT_EPISODE_V2', 'PC_WANT_EPISODE'],
     isneedQc: true,
   };
-  const response = await fetch(apiUrl, {
-    method: 'POST',
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
-      'Content-Type': 'application/json',
-      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
-      Origin: 'https://v.qq.com',
-      Referer: `https://v.qq.com/x/search/?q=${encodeURIComponent(query)}`,
-    },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) return [];
-  const data = await response.json();
-  const items = data.data?.normalList?.itemList || [];
-  return items
-    .map((item) => tencentResultFromItem(query, item))
-    .filter(Boolean)
-    .slice(0, 4);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), TENCENT_ATTEMPT_TIMEOUT_MS);
+  try {
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+        'Content-Type': 'application/json',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+        Origin: 'https://v.qq.com',
+        Referer: `https://v.qq.com/x/search/?q=${encodeURIComponent(originalQuery)}`,
+      },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(`Tencent search failed: ${response.status}`);
+    const data = await response.json();
+    return data.data?.normalList?.itemList || [];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function tencentQueryVariants(query) {
+  const variants = [cleanText(query)];
+  const withoutParticle = cleanText(query).replace(/的/g, '');
+  if (withoutParticle && withoutParticle !== variants[0]) variants.push(withoutParticle);
+  const compactSeason = cleanText(query).replace(/第\s*(\d+)\s*季/g, '$1');
+  if (compactSeason && !variants.includes(compactSeason)) variants.push(compactSeason);
+  const trailingSeason = cleanText(query).match(/^(.*?)(\d{1,2})$/);
+  if (trailingSeason && Number(trailingSeason[2]) <= 20) {
+    const expandedSeason = `${trailingSeason[1].trim()} 第${trailingSeason[2]}季`;
+    if (!variants.includes(expandedSeason)) variants.push(expandedSeason);
+  }
+  const preferredFallback = variants.find((variant) => /第\d+季$/.test(variant))
+    || variants.find((variant) => variant !== variants[0]);
+  return uniqueNonEmpty([variants[0], preferredFallback]).slice(0, 2);
+}
+
+function isTencentProgramAlbum(query, info) {
+  const title = cleanText(info.title || '');
+  const qqSite = (info.episodeSites || []).find((site) => site.enName === 'qq');
+  if (!title || !qqSite || !Array.isArray(qqSite.episodeInfoList) || !qqSite.episodeInfoList.length) return false;
+  if (!/(?:综艺|电视剧|纪录片)/.test(info.typeName || '')) return false;
+  if (/纯享版?|速看|精彩片段|高光|合集|系列|reaction|二创/i.test(title)) return false;
+  if (!info.year && /纯享|系列|合集|片段/.test(`${title} ${info.descrip || ''}`)) return false;
+  return tencentTitleMatchScore(query, `${title} ${info.hintWords || ''}`) >= 75;
+}
+
+function tencentTitleMatchScore(query, title) {
+  const normalizedQuery = normalizeTencentTitle(query);
+  const normalizedTitle = normalizeTencentTitle(title);
+  if (!normalizedQuery || !normalizedTitle) return 0;
+  if (normalizedQuery === normalizedTitle) return 100;
+  if (normalizedTitle.includes(normalizedQuery) || normalizedQuery.includes(normalizedTitle)) return 94;
+
+  const baseQuery = tencentBaseTitle(normalizedQuery);
+  const baseTitle = tencentBaseTitle(normalizedTitle);
+  if (baseQuery === baseTitle && baseQuery.length >= 3) return 90;
+  const looseQuery = baseQuery.replace(/的/g, '');
+  const looseTitle = baseTitle.replace(/的/g, '');
+  if (looseQuery === looseTitle && looseQuery.length >= 3) return 86;
+  if (looseQuery.length >= 4 && (looseTitle.includes(looseQuery) || looseQuery.includes(looseTitle))) return 78;
+  return 0;
+}
+
+function normalizeTencentTitle(value) {
+  return normalizeIqiyiTitle(value).replace(/[·:：()（）\-—_]/g, '');
+}
+
+function tencentBaseTitle(value) {
+  return value
+    .replace(/第?\d+季/g, '')
+    .replace(/20\d{2}(?:季|年)?/g, '')
+    .replace(/\d+$/, '');
 }
 
 function tencentResultFromItem(query, item) {
@@ -579,40 +661,52 @@ function tencentResultFromItem(query, item) {
   const title = cleanText(info.title || '');
   if (!title) return null;
 
-  const normalizedTitle = normalizeSearchText(title);
-  const normalizedQuery = normalizeSearchText(query);
-  const distinctiveQuery = normalizedQuery.length > 3 ? normalizedQuery.slice(2) : normalizedQuery;
-  if (!normalizedTitle.includes(normalizedQuery) && !normalizedTitle.includes(distinctiveQuery)) return null;
-
-  const site = (info.episodeSites || []).find((entry) => entry.enName === 'qq') || (info.episodeSites || [])[0] || {};
+  const site = (info.episodeSites || []).find((entry) => entry.enName === 'qq') || {};
   const episodes = (site.episodeInfoList || []).filter((episode) => episode.checkUpTime);
   const mainEpisodes = episodes.filter(isMainEpisode);
   const parsed = mainEpisodes.length ? parsedFromTencentEpisodes(query, info, site, mainEpisodes) : null;
-  const episodeLines = episodes.slice(0, 8).map((episode) => `${episode.checkUpTime} ${episode.title}`).join('；');
-  const url = episodes[0]?.url || `https://v.qq.com/x/search/?q=${encodeURIComponent(query)}`;
+  const episodeLines = mainEpisodes.slice(0, 8).map((episode) => `${episode.checkUpTime} ${episode.title}`).join('；');
+  const url = mainEpisodes[0]?.url || `https://v.qq.com/x/search/?q=${encodeURIComponent(query)}`;
   const platforms = platformsFromEpisodeSites(info.episodeSites, '腾讯视频');
+  const exactTitle = tencentTitleMatchScore(query, `${title} ${info.hintWords || ''}`) >= 90;
+  const recurrence = tencentEpisodeRecurrence(mainEpisodes);
+  const confidence = parsed
+    ? parsed.scheduleVerified
+      ? (exactTitle ? 98 : 92)
+      : recurrence >= 2
+        ? (exactTitle ? 86 : 80)
+        : (exactTitle ? 72 : 65)
+    : 20;
 
   return {
     title,
     url,
-    snippet: [info.subTitle, info.descrip, episodeLines].filter(Boolean).join('。').slice(0, 700),
+    snippet: [info.hintWords, info.subTitle, info.descrip, episodeLines].filter(Boolean).join('。').slice(0, 700),
     source: platforms.join(' / '),
+    sources: parsed?.sources || [],
     sourceExcerpt: episodeLines,
     crawled: true,
-    confidence: parsed?.schedule?.every((slot) => slot.time) ? 90 : parsed?.schedule?.length ? 55 : 20,
+    verifiedByAi: false,
+    confidence,
     parsed,
   };
 }
 
 function parsedFromTencentEpisodes(query, info, site, episodes) {
   const title = cleanText(info.title || query);
-  const episodeDates = episodes
-    .map((episode) => episode.checkUpTime)
-    .filter(Boolean)
-    .sort();
   const verified = verifiedTencentSchedule(title, info);
-  const startDate = verified?.startDate || episodeDates[0] || '';
-  const schedule = verified?.schedule || scheduleFromTencentEpisodes(episodes, '');
+  const inferredSchedule = scheduleFromTencentEpisodes(episodes, TENCENT_DEFAULT_TIME);
+  const schedule = verified?.schedule || inferredSchedule;
+  const startDate = verified?.startDate || schedule.map((slot) => slot.startDate).filter(Boolean).sort()[0] || '';
+  const latestEpisode = Math.max(0, ...episodes.map(tencentEpisodeNumber));
+  const finished = episodes.some((episode) => /收官|总冠军诞生|最后一期|大结局|终极告别/.test(cleanText(episode.title || '')));
+  const estimatedTotal = latestEpisode <= 6 ? 10 : latestEpisode <= 10 ? 12 : latestEpisode + 2;
+  const totalEpisodes = Number(verified?.totalEpisodes || (finished ? latestEpisode : estimatedTotal) || 10);
+  const officialUrl = episodes.find((episode) => episode.url)?.url || `https://v.qq.com/x/search/?q=${encodeURIComponent(query)}`;
+  const sources = uniqueSources([
+    { title: '腾讯视频官方节目页', url: officialUrl },
+    ...(verified?.sources || []),
+  ]);
   return {
     title,
     mediaType: info.typeName === '电视剧' ? 'drama' : 'variety',
@@ -623,10 +717,12 @@ function parsedFromTencentEpisodes(query, info, site, episodes) {
     startDate,
     time: schedule[0]?.time || '',
     schedule,
-    totalEpisodes: Number(verified?.totalEpisodes || episodes.length || site.totalEpisode || 12),
+    totalEpisodes,
     firstEpisode: 1,
     weekday: schedule[0]?.weekday ?? (startDate ? new Date(`${startDate}T00:00:00`).getDay() : ''),
-    sources: verified?.sources || [],
+    sources,
+    scheduleVerified: Boolean(verified),
+    totalEpisodesEstimated: !verified?.totalEpisodes && !finished,
   };
 }
 
@@ -638,56 +734,130 @@ function platformsFromEpisodeSites(sites, fallback) {
 }
 
 function scheduleFromTencentEpisodes(episodes, defaultTime) {
-  const slotMap = new Map();
+  const records = [];
+  const seen = new Set();
   for (const episode of episodes) {
     const date = episode.checkUpTime;
-    if (!date) continue;
+    const episodeNumber = tencentEpisodeNumber(episode);
+    if (!date || !episodeNumber) continue;
     const weekday = new Date(`${date}T00:00:00`).getDay();
-    const partLabel = '正片';
-    const key = `${weekday}-${partLabel}`;
-    if (!slotMap.has(key)) {
-      slotMap.set(key, { weekday, time: defaultTime, startDate: date, partLabel, count: 0 });
-    }
-    slotMap.get(key).count += 1;
+    const key = `${episodeNumber}-${date}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    records.push({ episodeNumber, date, weekday });
   }
-  let slots = [...slotMap.values()].sort((a, b) => a.startDate.localeCompare(b.startDate));
+  if (!records.length) return [];
 
-  const saturdayMain = slots.find((slot) => slot.weekday === 6 && slot.partLabel === '正片');
-  const sundayMain = slots.find((slot) => slot.weekday === 0 && slot.partLabel === '正片');
-  if (saturdayMain && sundayMain) {
-    saturdayMain.partLabel = '上半期';
-    sundayMain.partLabel = '下半期';
+  const recentNumbers = [...new Set(records.map((record) => record.episodeNumber))]
+    .sort((a, b) => b - a)
+    .slice(0, 4);
+  const recentRecords = records.filter((record) => recentNumbers.includes(record.episodeNumber));
+  const weekdayCounts = new Map();
+  for (const record of recentRecords) {
+    if (!weekdayCounts.has(record.weekday)) weekdayCounts.set(record.weekday, new Set());
+    weekdayCounts.get(record.weekday).add(record.episodeNumber);
   }
+  const recurrenceThreshold = recentNumbers.length >= 2 ? 2 : 1;
+  const weekdays = [...weekdayCounts.entries()]
+    .filter(([, episodeNumbers]) => episodeNumbers.size >= recurrenceThreshold)
+    .map(([weekday]) => weekday);
+  const selectedWeekdays = weekdays.length ? weekdays : [records[0].weekday];
+  const slots = selectedWeekdays.map((weekday) => {
+    const candidates = records.filter((record) => record.weekday === weekday);
+    const inferredStarts = candidates
+      .map((record) => addDaysKey(record.date, -(record.episodeNumber - 1) * 7))
+      .sort();
+    return {
+      weekday,
+      time: defaultTime,
+      startDate: inferredStarts[0] || candidates[candidates.length - 1]?.date || '',
+      partLabel: '正片',
+    };
+  }).sort((a, b) => a.startDate.localeCompare(b.startDate));
 
-  return slots.map(({ count, ...slot }) => slot);
+  const labels = slots.length === 2 ? ['上半期', '下半期'] : slots.length === 3 ? ['上半期', '中期', '下半期'] : [];
+  return slots.map((slot, index) => ({ ...slot, partLabel: labels[index] || '正片' }));
 }
 
 function verifiedTencentSchedule(title, info) {
   const year = String(info.year || '');
-  if (!title.includes('地球超新鲜') || (year && year !== '2026') || (!title.includes('2') && year !== '2026')) return null;
-  return {
-    audience: 'SVIP',
-    startDate: '2026-06-27',
-    totalEpisodes: 10,
-    schedule: [
-      { weekday: 6, time: '12:00', startDate: '2026-06-27', partLabel: '上半期' },
-      { weekday: 0, time: '12:00', startDate: '2026-06-28', partLabel: '下半期' },
-    ],
-    sources: [
-      {
-        title: '腾讯综艺官微：地球超新鲜2定档',
-        url: 'https://weibo.com/3758512144/R4IDJy9nD',
-      },
-    ],
-  };
+  if (year && year !== '2026') return null;
+  const normalizedTitle = normalizeTencentTitle(title);
+  const catalog = [
+    {
+      match: '地球超新鲜', audience: 'SVIP', startDate: '2026-06-27', totalEpisodes: 10,
+      schedule: [
+        { weekday: 6, time: '12:00', startDate: '2026-06-27', partLabel: '上半期', audience: 'SVIP' },
+        { weekday: 0, time: '12:00', startDate: '2026-06-28', partLabel: '下半期', audience: 'SVIP' },
+      ],
+      sources: [{ title: '腾讯综艺官微：地球超新鲜2定档', url: 'https://weibo.com/3758512144/R4IDJy9nD' }],
+    },
+    {
+      match: '心动的信号第9季', audience: 'SVIP', startDate: '2026-08-03',
+      schedule: [
+        { weekday: 1, time: '12:00', startDate: '2026-08-03', partLabel: '上半期', audience: 'SVIP' },
+        { weekday: 2, time: '12:00', startDate: '2026-08-04', partLabel: '下半期', audience: 'SVIP' },
+      ],
+      sources: [{ title: '心动的信号9播出排期', url: 'https://ent.sina.cn/2026-07-30/detail-inikpxkk9723002.d.html' }],
+    },
+    {
+      match: '脱口秀和ta的朋友们第3季', audience: '会员', startDate: '2026-06-26', totalEpisodes: 10,
+      schedule: [
+        { weekday: 5, time: '12:00', startDate: '2026-06-26', partLabel: '上半期', audience: '会员' },
+        { weekday: 6, time: '12:00', startDate: '2026-06-27', partLabel: '下半期', audience: '会员' },
+      ],
+      sources: [{ title: '脱口秀和Ta的朋友们3播出排期', url: 'https://www.weibo.com/ttarticle/p/show?id=2309405314423513546803' }],
+    },
+    {
+      match: '一饭封神第2季', audience: 'SVIP', startDate: '2026-07-29',
+      schedule: [
+        { weekday: 3, time: '12:00', startDate: '2026-07-29', partLabel: '上半期', audience: 'SVIP' },
+        { weekday: 4, time: '12:00', startDate: '2026-07-30', partLabel: '下半期', audience: 'SVIP' },
+      ],
+      sources: [{ title: '一饭封神2官方排期', url: 'https://www.sina.cn/news/detail/5326465497564744.html' }],
+    },
+    {
+      match: '一路向海的少年', audience: 'SVIP', startDate: '2026-08-06',
+      schedule: [{ weekday: 4, time: '12:00', startDate: '2026-08-06', partLabel: '正片', audience: 'SVIP' }],
+      sources: [{ title: '一路向海的少年官方排期', url: 'https://weibo.com/2/detail/5336465564501520' }],
+    },
+  ];
+  const entry = catalog.find((item) => normalizedTitle.includes(item.match));
+  return entry ? { ...entry } : null;
 }
 
 function isMainEpisode(episode) {
   const title = cleanText(episode.title || '');
   if (!title) return false;
   if (/预告|抢先看|加更|特别|游戏|会员版|衍生|花絮|纯享|陪看|直播|彩蛋|reaction|Reaction/i.test(title)) return false;
-  if (/福利篇|名场面|集锦|番外|幕后|专访/.test(title)) return false;
-  return /第\s*\d+\s*期/.test(title);
+  if (/福利篇|名场面|集锦|番外|幕后|专访|TOP\s*\d+|段子|切片|精华/.test(title)) return false;
+  return /第\s*\d+\s*期(?:[上中下]|[：:（(]|\s*$)/.test(title);
+}
+
+function tencentEpisodeNumber(episode) {
+  const match = cleanText(episode?.title || '').match(/第\s*(\d+)\s*期/);
+  return match ? Number(match[1]) : 0;
+}
+
+function tencentEpisodeRecurrence(episodes) {
+  const byWeekday = new Map();
+  for (const episode of episodes) {
+    const episodeNumber = tencentEpisodeNumber(episode);
+    if (!episodeNumber || !episode.checkUpTime) continue;
+    const weekday = new Date(`${episode.checkUpTime}T00:00:00`).getDay();
+    if (!byWeekday.has(weekday)) byWeekday.set(weekday, new Set());
+    byWeekday.get(weekday).add(episodeNumber);
+  }
+  return Math.max(0, ...[...byWeekday.values()].map((episodeNumbers) => episodeNumbers.size));
+}
+
+function uniqueSources(sources) {
+  const seen = new Set();
+  return sources.filter((source) => {
+    if (!source?.url || seen.has(source.url)) return false;
+    seen.add(source.url);
+    return true;
+  });
 }
 
 async function searchMediaWiki(query) {
@@ -1005,10 +1175,10 @@ function escapeRegExp(value) {
 }
 
 function prioritizeResults(query, results) {
-  const normalizedQuery = normalizeIqiyiTitle(query);
+  const normalizedQuery = normalizePriorityTitle(query);
   const distinctiveQuery = normalizedQuery.length > 3 ? normalizedQuery.slice(2) : normalizedQuery;
   const scored = results.map((item) => {
-    const text = normalizeIqiyiTitle(`${item.title} ${item.snippet}`);
+    const text = normalizePriorityTitle(`${item.title} ${item.snippet}`);
     let score = 0;
     if (text.includes(normalizedQuery)) score += 8;
     if (distinctiveQuery.length >= 2 && text.includes(distinctiveQuery)) score += 4;
@@ -1016,12 +1186,16 @@ function prioritizeResults(query, results) {
     if (item.source === '小红书' || item.source === 'OpenCLI 小红书') score += 1;
     return { ...item, score };
   });
-  const exact = scored.filter((item) => normalizeIqiyiTitle(`${item.title} ${item.snippet}`).includes(normalizedQuery));
+  const exact = scored.filter((item) => normalizePriorityTitle(`${item.title} ${item.snippet}`).includes(normalizedQuery));
   const relevant = scored.filter((item) => item.score >= 4);
   const pool = exact.length ? exact : relevant;
   return pool
     .sort((a, b) => (b.score - a.score) || (resultScore(b) - resultScore(a)))
     .map(({ score, ...item }) => item);
+}
+
+function normalizePriorityTitle(value) {
+  return normalizeIqiyiTitle(value).replace(/第(\d+)季/g, '$1');
 }
 
 function normalizeSearchText(value) {
