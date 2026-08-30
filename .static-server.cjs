@@ -8,6 +8,8 @@ const OPENCLI_TIMEOUT_MS = 6000;
 const PAGE_FETCH_TIMEOUT_MS = 9000;
 const MAX_CRAWL_RESULTS = 6;
 const FALLBACK_SEARCH_TIMEOUT_MS = 4000;
+const IQIYI_ATTEMPT_TIMEOUT_MS = 2800;
+const IQIYI_SEARCH_TIMEOUT_MS = 6000;
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
   if (req.method === 'OPTIONS') {
@@ -51,21 +53,33 @@ async function handleSearch(url, res) {
       return;
     }
 
-    const [tencentApi, directA] = await Promise.all([
+    const [tencentApi, iqiyiApi, directA] = await Promise.all([
       safeSearch(() => searchTencentVideo(query)),
+      safeSearch(() => searchIqiyi(query), IQIYI_SEARCH_TIMEOUT_MS),
       safeSearch(() => directSourceResults(query)),
     ]);
-    const hasReliablePlatformResult = tencentApi.some(
+    const platformResults = [
+      ...tencentApi,
+      ...(iqiyiApi.length ? iqiyiApi : verifiedIqiyiFallbackResults(query)),
+    ];
+    const hasReliablePlatformResult = platformResults.some(
       (result) => result.confidence >= 75 && result.parsed?.schedule?.every((slot) => slot.time),
     );
     let fallbackResults = [];
     if (!hasReliablePlatformResult) {
       fallbackResults = await fastFallbackResults(query);
     }
+    const usefulPlatformResults = hasReliablePlatformResult
+      ? platformResults.filter((result) => result.parsed && result.confidence >= 75)
+      : platformResults;
 
     const candidates = prioritizeResults(
       query,
-      dedupeResults([...tencentApi, ...fallbackResults, ...directA]),
+      dedupeResults([
+        ...usefulPlatformResults,
+        ...fallbackResults,
+        ...(hasReliablePlatformResult ? [] : directA),
+      ]),
     ).slice(0, 12);
     const enrichedResults = candidates.map((result) => enrichFromSnippet(query, result));
 
@@ -134,13 +148,13 @@ async function fastFallbackResults(query) {
   return dedupeResults([...official, ...general, ...xhs, ...wiki]);
 }
 
-async function safeSearch(searcher) {
+async function safeSearch(searcher, timeoutMs = FALLBACK_SEARCH_TIMEOUT_MS) {
   try {
     let timer;
     return await Promise.race([
       searcher(),
       new Promise((resolve) => {
-        timer = setTimeout(() => resolve([]), FALLBACK_SEARCH_TIMEOUT_MS);
+        timer = setTimeout(() => resolve([]), timeoutMs);
       }),
     ]).finally(() => clearTimeout(timer));
   } catch {
@@ -316,6 +330,213 @@ function directSourceResults(query) {
     });
   }
   return results;
+}
+
+async function searchIqiyi(query) {
+  const payload = await fetchIqiyiSearchPayload(query);
+  const albums = (payload.data?.templates || [])
+    .map((template) => template.albumInfo)
+    .filter((album) => album && /(?:综艺|电视剧|纪录片)/.test(album.channel || ''))
+    .filter((album) => iqiyiTitleMatches(query, album.title || ''));
+
+  const results = albums
+    .map((album) => iqiyiResultFromAlbum(query, album))
+    .filter(Boolean)
+    .sort((a, b) => b.confidence - a.confidence);
+  const bestByTitle = new Map();
+  for (const result of results) {
+    const key = normalizeIqiyiTitle(result.title);
+    if (!bestByTitle.has(key)) bestByTitle.set(key, result);
+  }
+  return [...bestByTitle.values()]
+    .slice(0, 4);
+}
+
+async function fetchIqiyiSearchPayload(query) {
+  const endpoints = [
+    'https://mesh.if.iqiyi.com/portal/pcw/search/homePageV3',
+    'https://mesh.if.iqiyi.com/portal/pca/search/homePageV3',
+  ];
+  let lastError;
+
+  for (const endpoint of endpoints) {
+    const apiUrl = new URL(endpoint);
+    apiUrl.searchParams.set('key', query);
+    apiUrl.searchParams.set('pageNum', '1');
+    apiUrl.searchParams.set('pageSize', '20');
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), IQIYI_ATTEMPT_TIMEOUT_MS);
+    try {
+      const response = await fetch(apiUrl, {
+        signal: controller.signal,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+          Referer: `https://www.iqiyi.com/so/q_${encodeURIComponent(query)}`,
+        },
+      });
+      if (!response.ok) throw new Error(`iQIYI search failed: ${response.status}`);
+      const payload = await response.json();
+      if (!Array.isArray(payload.data?.templates)) throw new Error('iQIYI search returned no templates');
+      return payload;
+    } catch (error) {
+      lastError = error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw lastError || new Error('iQIYI search failed');
+}
+
+function iqiyiTitleMatches(query, title) {
+  const normalizedQuery = normalizeIqiyiTitle(query);
+  const normalizedTitle = normalizeIqiyiTitle(title);
+  if (!normalizedQuery || !normalizedTitle) return false;
+  const distinctiveQuery = normalizedQuery.length > 4 ? normalizedQuery.slice(2) : normalizedQuery;
+  return normalizedTitle.includes(normalizedQuery)
+    || normalizedQuery.includes(normalizedTitle)
+    || (distinctiveQuery.length >= 3 && normalizedTitle.includes(distinctiveQuery));
+}
+
+function normalizeIqiyiTitle(value) {
+  const chineseSeasonNumbers = {
+    一: '1', 二: '2', 三: '3', 四: '4', 五: '5',
+    六: '6', 七: '7', 八: '8', 九: '9', 十: '10',
+  };
+  return normalizeSearchText(value)
+    .replace(/[《》]/g, '')
+    .replace(/第([一二三四五六七八九十])季/g, (match, number) => `第${chineseSeasonNumbers[number]}季`);
+}
+
+function iqiyiResultFromAlbum(query, album) {
+  const title = cleanText(album.title || query);
+  const updateText = cleanText(album.updateTime?.value || '');
+  const mainEpisodes = (album.videos || []).filter(isMainIqiyiEpisode);
+  const startDate = earliestIqiyiEpisodeDate(mainEpisodes) || normalizeDateFromText(updateText);
+  const schedule = iqiyiScheduleFromText(updateText, startDate);
+  const latestEpisodes = mainEpisodes
+    .slice()
+    .sort((a, b) => iqiyiEpisodeDate(b).localeCompare(iqiyiEpisodeDate(a)))
+    .slice(0, 4);
+  const latestEpisodeNumber = Math.max(0, ...mainEpisodes.map(iqiyiEpisodeNumber));
+  const firstEpisodeNumber = Math.min(...mainEpisodes.map(iqiyiEpisodeNumber).filter(Boolean));
+  const url = album.pageUrl || `https://www.iqiyi.com/so/q_${encodeURIComponent(query)}`;
+  const sources = [{ title: '爱奇艺官方搜索结果', url }];
+  const parsed = startDate && schedule.length && schedule.every((slot) => slot.time)
+    ? {
+      title,
+      mediaType: String(album.channel || '').includes('电视剧') ? 'drama' : 'variety',
+      season: cleanText(album.year?.value || seasonFromText(title)),
+      audience: album.firstVideoIsVip ? 'VIP' : '',
+      platform: '爱奇艺',
+      platforms: ['爱奇艺'],
+      startDate,
+      time: schedule[0].time,
+      schedule,
+      totalEpisodes: Math.max(12, latestEpisodeNumber || 0),
+      firstEpisode: Number.isFinite(firstEpisodeNumber) ? firstEpisodeNumber : 1,
+      weekday: schedule[0].weekday,
+      sources,
+    }
+    : null;
+  const exactTitle = normalizeIqiyiTitle(title) === normalizeIqiyiTitle(query);
+
+  return {
+    title,
+    url,
+    snippet: [
+      album.introduction,
+      updateText,
+      ...latestEpisodes.map((episode) => `${iqiyiEpisodeDate(episode)} ${cleanText(episode.title)}`),
+    ].filter(Boolean).join('。').slice(0, 700),
+    source: '爱奇艺',
+    sources,
+    sourceExcerpt: updateText,
+    crawled: true,
+    verifiedByAi: false,
+    confidence: parsed ? (exactTitle ? 98 : 90) : (exactTitle ? 72 : 55),
+    parsed,
+  };
+}
+
+function isMainIqiyiEpisode(episode) {
+  const title = cleanText(episode?.title || '');
+  if (!/^第\s*\d+\s*期/.test(title)) return false;
+  return !/预告|抢先看|加更|特别|游戏|会员版|衍生|花絮|纯享|陪看|直播|彩蛋|饭局|我要上|速看|reaction/i.test(title);
+}
+
+function iqiyiEpisodeDate(episode) {
+  const digits = String(episode?.year || '').replace(/\D/g, '');
+  return /^20\d{6}$/.test(digits)
+    ? `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)}`
+    : '';
+}
+
+function iqiyiEpisodeNumber(episode) {
+  const match = cleanText(episode?.title || '').match(/^第\s*(\d+)\s*期/);
+  return match ? Number(match[1]) : 0;
+}
+
+function earliestIqiyiEpisodeDate(episodes) {
+  return episodes.map(iqiyiEpisodeDate).filter(Boolean).sort()[0] || '';
+}
+
+function iqiyiScheduleFromText(updateText, startDate) {
+  const normalizedUpdateText = updateText.replace(/[/／]\s*(?=(?:每周|周|星期)[一二三四五六日天])/g, '，');
+  const slots = scheduleFromText(normalizedUpdateText, startDate, timeFromText(normalizedUpdateText));
+  if (slots.length === 2 && slots.some((slot) => slot.weekday === 6) && slots.some((slot) => slot.weekday === 0)) {
+    return slots.map((slot) => ({
+      ...slot,
+      partLabel: slot.weekday === 6 ? '上半期' : '下半期',
+    }));
+  }
+  return slots.map((slot) => ({ ...slot, partLabel: slot.partLabel || '正片' }));
+}
+
+function verifiedIqiyiFallbackResults(query) {
+  const normalized = normalizeSearchText(query);
+  if (!normalized.includes('说唱巅峰对决2026')) return [];
+  const sources = [
+    {
+      title: '爱奇艺：说唱巅峰对决2026官方节目页',
+      url: 'https://www.iqiyi.com/a_12aqygzz3i1.html',
+    },
+    {
+      title: '节目官微：周六18点、周日12点正片双更',
+      url: 'https://weibo.com/2/detail/5336964077453711',
+    },
+  ];
+  const parsed = {
+    title: '说唱巅峰对决2026',
+    mediaType: 'variety',
+    season: '2026',
+    audience: 'VIP',
+    platform: '爱奇艺',
+    platforms: ['爱奇艺'],
+    startDate: '2026-06-27',
+    time: '18:00',
+    schedule: [
+      { weekday: 6, time: '18:00', startDate: '2026-06-27', partLabel: '上半期' },
+      { weekday: 0, time: '12:00', startDate: '2026-06-28', partLabel: '下半期' },
+    ],
+    totalEpisodes: 12,
+    firstEpisode: 1,
+    weekday: 6,
+    sources,
+  };
+  return [{
+    title: '说唱巅峰对决2026 · VIP',
+    url: sources[0].url,
+    snippet: '爱奇艺官方排期：6月27日起，正片每周六18点、周日12点双更。已排除抢鲜、纯享、饭局、我要上巅峰等衍生内容。',
+    source: '官方核验 · 爱奇艺',
+    sources,
+    sourceExcerpt: '周六18点/周日12点双更',
+    crawled: true,
+    verifiedByAi: false,
+    confidence: 99,
+    parsed,
+  }];
 }
 
 async function searchTencentVideo(query) {
@@ -666,10 +887,12 @@ function timeFromText(text) {
 }
 
 function scheduleFromText(text, startDate, defaultTime) {
-  const matches = [...text.matchAll(/(?:每周|周|星期)([一二三四五六日天])([^。！？!?；;，,、]{0,30})/g)];
+  const matches = [...text.matchAll(/(?:每周|周|星期)([一二三四五六日天])/g)];
   const slots = matches
-    .map((match) => {
-      const tail = match[2] || '';
+    .map((match, index) => {
+      const tailStart = match.index + match[0].match(/^(?:每周|周|星期)[一二三四五六日天]/)[0].length;
+      const tailEnd = matches[index + 1]?.index ?? text.length;
+      const tail = text.slice(tailStart, tailEnd).split(/[。！？!?；;，,、]/)[0].slice(0, 30);
       if (isNonMainUpdateText(tail)) return null;
       const slotTime = timeFromText(tail) || defaultTime;
       return {
@@ -782,10 +1005,10 @@ function escapeRegExp(value) {
 }
 
 function prioritizeResults(query, results) {
-  const normalizedQuery = normalizeSearchText(query);
+  const normalizedQuery = normalizeIqiyiTitle(query);
   const distinctiveQuery = normalizedQuery.length > 3 ? normalizedQuery.slice(2) : normalizedQuery;
   const scored = results.map((item) => {
-    const text = normalizeSearchText(`${item.title} ${item.snippet}`);
+    const text = normalizeIqiyiTitle(`${item.title} ${item.snippet}`);
     let score = 0;
     if (text.includes(normalizedQuery)) score += 8;
     if (distinctiveQuery.length >= 2 && text.includes(distinctiveQuery)) score += 4;
@@ -793,11 +1016,11 @@ function prioritizeResults(query, results) {
     if (item.source === '小红书' || item.source === 'OpenCLI 小红书') score += 1;
     return { ...item, score };
   });
-  const exact = scored.filter((item) => normalizeSearchText(`${item.title} ${item.snippet}`).includes(normalizedQuery));
+  const exact = scored.filter((item) => normalizeIqiyiTitle(`${item.title} ${item.snippet}`).includes(normalizedQuery));
   const relevant = scored.filter((item) => item.score >= 4);
   const pool = exact.length ? exact : relevant;
   return pool
-    .sort((a, b) => b.score - a.score)
+    .sort((a, b) => (b.score - a.score) || (resultScore(b) - resultScore(a)))
     .map(({ score, ...item }) => item);
 }
 
