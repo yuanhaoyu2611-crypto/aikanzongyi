@@ -7,6 +7,9 @@ android/local.properties
 ios-web/
 ios/App/build/
 ios/DerivedData/
+*.ipa
+*-artifact.zip
+.ios-artifact/
 
 .env
 .env.*
