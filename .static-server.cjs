@@ -1,6 +1,7 @@
 ﻿const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { execFile } = require('child_process');
 const root = __dirname;
 const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.webmanifest': 'application/manifest+json; charset=utf-8' };
@@ -13,6 +14,12 @@ const IQIYI_SEARCH_TIMEOUT_MS = 6000;
 const TENCENT_ATTEMPT_TIMEOUT_MS = 3000;
 const TENCENT_SEARCH_TIMEOUT_MS = 6500;
 const TENCENT_DEFAULT_TIME = '12:00';
+const MANGO_ATTEMPT_TIMEOUT_MS = 3200;
+const MANGO_SEARCH_TIMEOUT_MS = 7000;
+const MANGO_DEFAULT_TIME = '12:00';
+const YOUKU_ATTEMPT_TIMEOUT_MS = 4500;
+const YOUKU_SEARCH_TIMEOUT_MS = 7000;
+const YOUKU_DEFAULT_TIME = '12:00';
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
   if (req.method === 'OPTIONS') {
@@ -56,15 +63,19 @@ async function handleSearch(url, res) {
       return;
     }
 
-    const [tencentApi, iqiyiApi, directA] = await Promise.all([
+    const [tencentApi, iqiyiApi, mangoApi, youkuApi, directA] = await Promise.all([
       safeSearch(() => searchTencentVideo(query), TENCENT_SEARCH_TIMEOUT_MS),
       safeSearch(() => searchIqiyi(query), IQIYI_SEARCH_TIMEOUT_MS),
+      safeSearch(() => searchMangoTv(query), MANGO_SEARCH_TIMEOUT_MS),
+      safeSearch(() => searchYouku(query), YOUKU_SEARCH_TIMEOUT_MS),
       safeSearch(() => directSourceResults(query)),
     ]);
-    const platformResults = [
+    const platformResults = mergeEquivalentPlatformResults(query, [
       ...tencentApi,
       ...(iqiyiApi.length ? iqiyiApi : verifiedIqiyiFallbackResults(query)),
-    ];
+      ...mangoApi,
+      ...youkuApi,
+    ]);
     const hasReliablePlatformResult = platformResults.some(
       (result) => result.confidence >= 75 && result.parsed?.schedule?.every((slot) => slot.time),
     );
@@ -542,6 +553,540 @@ function verifiedIqiyiFallbackResults(query) {
   }];
 }
 
+async function searchMangoTv(query) {
+  const payload = await fetchMangoSearchPayload(query);
+  const albums = (payload.data?.contents || [])
+    .filter((content) => content.type === 'program')
+    .flatMap((content) => content.data?.yearList || [])
+    .filter((album) => isMangoProgramAlbum(query, album))
+    .sort((a, b) => mangoAlbumScore(query, b) - mangoAlbumScore(query, a));
+
+  const uniqueAlbums = [];
+  const seen = new Set();
+  for (const album of albums) {
+    const source = mangoSource(album);
+    const key = source?.url || `${cleanHtml(album.title || '')}-${album.year || ''}`;
+    if (!source || seen.has(key)) continue;
+    seen.add(key);
+    uniqueAlbums.push(album);
+  }
+
+  const results = await Promise.all(
+    uniqueAlbums.slice(0, 4).map((album) => mangoResultFromAlbum(query, album)),
+  );
+  return results.filter(Boolean).sort((a, b) => b.confidence - a.confidence);
+}
+
+async function fetchMangoSearchPayload(query) {
+  const secret = 'xHAa3YZflWLogZUOzl';
+  const randomId = () => crypto.randomUUID().replace(/-/g, '');
+  const params = {
+    src: 'mgtv',
+    did: randomId(),
+    timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+    signVersion: '1',
+    signNonce: randomId(),
+    q: query,
+    pn: '1',
+    pc: '20',
+    corr: randomId(),
+  };
+  const queryString = Object.keys(params)
+    .filter((key) => String(params[key]).trim())
+    .sort()
+    .map((key) => `${encodeURI(key)}=${encodeURI(String(params[key]))}`)
+    .join('&');
+  const signature = crypto.createHash('md5').update(`${secret}${queryString}${secret}`).digest('hex');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MANGO_ATTEMPT_TIMEOUT_MS);
+  try {
+    const response = await fetch(`https://mobileso.bz.mgtv.com/pc/search/v2?${queryString}&signature=${signature}`, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+        Referer: `https://so.mgtv.com/so/k-${encodeURIComponent(query)}`,
+      },
+    });
+    if (!response.ok) throw new Error(`Mango search failed: ${response.status}`);
+    const payload = await response.json();
+    if (!Array.isArray(payload.data?.contents)) throw new Error('Mango search returned no contents');
+    return payload;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function mangoSource(album) {
+  return (album.sourceList || []).find((source) => /^(?:imgo|mgtv)$/i.test(source.source || ''))
+    || (album.sourceList || [])[0];
+}
+
+function mangoDescriptionText(album) {
+  if (Array.isArray(album.desc)) return album.desc.map((item) => cleanText(item?.text || '')).join(' ');
+  return cleanText(album.desc || album.story || '');
+}
+
+function isMangoProgramAlbum(query, album) {
+  const title = cleanHtml(album.title || album.hitTitle || '');
+  if (!title || !mangoSource(album)) return false;
+  if (!officialTitleMatches(query, title, album.year)) return false;
+  return !isUnrequestedDerivative(query, title);
+}
+
+function mangoAlbumScore(query, album) {
+  const title = cleanHtml(album.title || album.hitTitle || '');
+  let score = tencentTitleMatchScore(query, title);
+  if (normalizeTencentTitle(query) === normalizeTencentTitle(title)) score += 20;
+  if (String(album.year || '') === String(new Date().getFullYear())) score += 4;
+  if (cleanText(album.playTime || '')) score += 3;
+  return score;
+}
+
+async function mangoResultFromAlbum(query, album) {
+  const title = cleanHtml(album.title || album.hitTitle || query);
+  const source = mangoSource(album);
+  if (!source) return null;
+  const episodes = await fetchMangoEpisodes(source);
+  const mainEpisodes = episodes.filter(isMainMangoEpisode);
+  const latestEpisode = Math.max(0, ...mainEpisodes.map(mangoEpisodeNumber));
+  const inferredStartDate = inferEpisodeStartDate(mainEpisodes, mangoEpisodeDate, mangoEpisodeNumber);
+  const playTime = cleanText(album.playTime || '');
+  const inferredSchedule = scheduleFromTencentEpisodes(
+    mainEpisodes.map((episode) => ({
+      title: cleanText(episode.title || episode.subtitle || ''),
+      checkUpTime: mangoEpisodeDate(episode),
+    })),
+    MANGO_DEFAULT_TIME,
+  );
+  let schedule = playTime
+    ? scheduleFromText(expandCompactWeekdays(playTime), inferredStartDate, timeFromText(playTime) || MANGO_DEFAULT_TIME)
+    : inferredSchedule;
+  schedule = filterMangoMainSchedule(schedule, episodes, mainEpisodes);
+  schedule = labelMainScheduleParts(schedule, mainEpisodes.map((episode) => episode.title || ''));
+  const startDate = schedule.map((slot) => slot.startDate).filter(Boolean).sort()[0] || inferredStartDate;
+  const episodeText = mainEpisodes.map((episode) => cleanText(episode.title || '')).join(' ');
+  const finished = /收官|最后一期|大结局|终极告别|全\s*\d+\s*期/.test(`${album.story || ''} ${playTime} ${episodeText}`);
+  const totalEpisodes = latestEpisode
+    ? (finished ? latestEpisode : estimateEpisodeTotal(latestEpisode))
+    : 12;
+  const audience = uniqueNonEmpty(mainEpisodes.map((episode) => episode.rightCorner?.text).filter((value) => /VIP|会员/i.test(value || ''))).join(' / ');
+  const url = absolutePlatformUrl(source.url, 'https://www.mgtv.com');
+  const sources = [{ title: '芒果TV官方节目页', url }];
+  const parsed = startDate && schedule.length && schedule.every((slot) => slot.time)
+    ? {
+      title,
+      mediaType: /电视剧|剧集/.test(mangoDescriptionText(album)) ? 'drama' : 'variety',
+      season: cleanText(album.year || seasonFromText(title)),
+      audience,
+      platform: '芒果TV',
+      platforms: ['芒果TV'],
+      startDate,
+      time: schedule[0].time,
+      schedule,
+      totalEpisodes,
+      firstEpisode: 1,
+      weekday: schedule[0].weekday,
+      sources,
+      scheduleVerified: Boolean(playTime),
+      totalEpisodesEstimated: !finished,
+    }
+    : null;
+  const exactTitle = tencentTitleMatchScore(query, title) >= 90;
+  const recurrence = tencentEpisodeRecurrence(
+    mainEpisodes.map((episode) => ({ title: episode.title, checkUpTime: mangoEpisodeDate(episode) })),
+  );
+  const confidence = parsed
+    ? playTime ? (exactTitle ? 98 : 91) : recurrence >= 2 ? (exactTitle ? 87 : 80) : (exactTitle ? 73 : 65)
+    : exactTitle ? 68 : 45;
+
+  return {
+    title,
+    url,
+    snippet: [album.story, playTime, ...mainEpisodes.slice(0, 6).map((episode) => episode.title)].filter(Boolean).join('。').slice(0, 700),
+    source: '芒果TV',
+    sources,
+    sourceExcerpt: playTime || mainEpisodes.slice(0, 5).map((episode) => episode.title).join('；'),
+    crawled: true,
+    verifiedByAi: false,
+    confidence,
+    parsed,
+  };
+}
+
+async function fetchMangoEpisodes(source) {
+  const episodes = [...(source.videoList || [])];
+  let moreUrl = source.moreUrl || '';
+  for (let page = 0; moreUrl && page < 3; page += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), MANGO_ATTEMPT_TIMEOUT_MS);
+    try {
+      const response = await fetch(new URL(moreUrl, 'https://mobileso.bz.mgtv.com'), {
+        signal: controller.signal,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+          Referer: 'https://so.mgtv.com/',
+        },
+      });
+      if (!response.ok) break;
+      const payload = await response.json();
+      episodes.push(...(payload.data?.videoList || []));
+      moreUrl = payload.data?.hasMore ? payload.data?.moreUrl || '' : '';
+    } catch {
+      break;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  const seen = new Set();
+  return episodes.filter((episode) => {
+    const key = episode.url || episode.title;
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function isMainMangoEpisode(episode) {
+  const title = cleanText(episode?.title || episode?.subtitle || '');
+  if (!/第\s*\d+\s*期/.test(title)) return false;
+  return !/预告|抢先|超前|加更|特别|会员|衍生|花絮|纯享|陪看|直播|彩蛋|Plus|大神版|日记|营业|盲盒|全放送|直拍|训练室|reaction/i.test(title);
+}
+
+function mangoEpisodeDate(episode) {
+  return normalizeDateFromText(cleanText(episode?.title || ''));
+}
+
+function mangoEpisodeNumber(episode) {
+  const match = cleanText(episode?.title || episode?.subtitle || '').match(/第\s*(\d+)\s*期/);
+  return match ? Number(match[1]) : 0;
+}
+
+function filterMangoMainSchedule(schedule, episodes, mainEpisodes) {
+  if (schedule.length < 2 || !mainEpisodes.length) return schedule;
+  const mainWeekdays = new Set(mainEpisodes.map(mangoEpisodeDate).filter(Boolean).map((date) => new Date(`${date}T00:00:00`).getDay()));
+  const excludedCounts = new Map();
+  for (const episode of episodes.filter((item) => !isMainMangoEpisode(item))) {
+    const date = mangoEpisodeDate(episode);
+    if (!date) continue;
+    const weekday = new Date(`${date}T00:00:00`).getDay();
+    excludedCounts.set(weekday, (excludedCounts.get(weekday) || 0) + 1);
+  }
+  const filtered = schedule.filter((slot) => mainWeekdays.has(slot.weekday) || (excludedCounts.get(slot.weekday) || 0) < 2);
+  return filtered.length ? filtered : schedule;
+}
+
+async function searchYouku(query) {
+  const payload = await fetchYoukuSearchPayload(query);
+  const groups = payload.data?.nodes || [];
+  const candidates = [];
+  for (const group of groups) {
+    const album = findFirstObject(group, (value) => value.realShowId && value.tempTitle && value.sourceId === 14);
+    if (!album || !isYoukuProgramAlbum(query, album)) continue;
+    const mainTab = findFirstNode(group, (node) => node.data?.tabName === '正片');
+    const episodes = findAllObjects(mainTab || group, (value) => value.showVideoStage && value.displayName && value.vid);
+    candidates.push({ album, episodes });
+  }
+
+  const results = candidates
+    .map(({ album, episodes }) => youkuResultFromAlbum(query, album, episodes))
+    .filter(Boolean)
+    .sort((a, b) => b.confidence - a.confidence);
+  const bestByTitle = new Map();
+  for (const result of results) {
+    const key = normalizeTencentTitle(result.title);
+    if (!bestByTitle.has(key)) bestByTitle.set(key, result);
+  }
+  return [...bestByTitle.values()].slice(0, 4);
+}
+
+async function fetchYoukuSearchPayload(query) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), YOUKU_ATTEMPT_TIMEOUT_MS);
+  try {
+    const response = await fetch(`https://so.youku.com/search/q_${encodeURIComponent(query)}`, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+        Accept: 'text/html,application/xhtml+xml',
+      },
+    });
+    if (!response.ok) throw new Error(`Youku search failed: ${response.status}`);
+    const html = await response.text();
+    const json = extractAssignedJson(html, 'window.__INITIAL_DATA__');
+    if (!json) throw new Error('Youku search returned no initial data');
+    return JSON.parse(json);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function extractAssignedJson(text, marker) {
+  const markerIndex = text.indexOf(marker);
+  const start = text.indexOf('{', markerIndex);
+  if (markerIndex < 0 || start < 0) return '';
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === '{') depth += 1;
+    else if (char === '}' && --depth === 0) return text.slice(start, index + 1);
+  }
+  return '';
+}
+
+function findFirstObject(value, predicate) {
+  if (!value || typeof value !== 'object') return null;
+  if (!Array.isArray(value) && predicate(value)) return value;
+  for (const child of Object.values(value)) {
+    const found = findFirstObject(child, predicate);
+    if (found) return found;
+  }
+  return null;
+}
+
+function findFirstNode(value, predicate) {
+  if (!value || typeof value !== 'object') return null;
+  if (!Array.isArray(value) && predicate(value)) return value;
+  for (const child of Object.values(value)) {
+    const found = findFirstNode(child, predicate);
+    if (found) return found;
+  }
+  return null;
+}
+
+function findAllObjects(value, predicate, results = []) {
+  if (!value || typeof value !== 'object') return results;
+  if (!Array.isArray(value) && predicate(value)) results.push(value);
+  for (const child of Object.values(value)) findAllObjects(child, predicate, results);
+  return results;
+}
+
+function isYoukuProgramAlbum(query, album) {
+  const title = cleanText(album.tempTitle || album.titleDTO?.displayName || '');
+  if (!title || !album.hasYouku || !/(?:综艺|电视剧|纪录片)/.test(`${album.cats || ''} ${album.featureDTO?.text || ''}`)) return false;
+  const year = (album.featureDTO?.text || '').match(/20\d{2}/)?.[0] || '';
+  return officialTitleMatches(query, title, year) && !isUnrequestedDerivative(query, title);
+}
+
+function youkuResultFromAlbum(query, album, episodes) {
+  const title = cleanText(album.tempTitle || album.titleDTO?.displayName || query);
+  const featureText = cleanText(album.featureDTO?.text || '');
+  const year = featureText.match(/20\d{2}/)?.[0] || '';
+  const updateNotice = cleanText(album.updateNotice || album.desc || verifiedYoukuUpdateNotice(title, year));
+  const mainEpisodes = episodes.filter(isMainYoukuEpisode);
+  const episodeDate = (episode) => youkuEpisodeDate(episode, year);
+  const inferredStartDate = inferEpisodeStartDate(mainEpisodes, episodeDate, youkuEpisodeNumber);
+  let schedule = youkuScheduleFromNotice(updateNotice, year, inferredStartDate);
+  if (!schedule.length) {
+    schedule = scheduleFromTencentEpisodes(
+      mainEpisodes.map((episode) => ({ title: episode.displayName, checkUpTime: episodeDate(episode) })),
+      YOUKU_DEFAULT_TIME,
+    );
+  }
+  const startDate = schedule.map((slot) => slot.startDate).filter(Boolean).sort()[0] || inferredStartDate;
+  const latestEpisode = Math.max(0, ...mainEpisodes.map(youkuEpisodeNumber));
+  const statedTotal = Number(album.episodeTotal || 0);
+  const finished = Boolean(album.completed) || /\d+\s*期全/.test(`${album.stripeBottom || ''} ${updateNotice}`);
+  const totalEpisodes = Math.max(latestEpisode, statedTotal, finished ? 0 : estimateEpisodeTotal(latestEpisode));
+  const audiences = uniqueNonEmpty(schedule.map((slot) => slot.audience));
+  const url = `https://so.youku.com/search/q_${encodeURIComponent(query)}`;
+  const sources = [{ title: '优酷官方搜索与节目排期', url }];
+  const parsed = startDate && schedule.length && schedule.every((slot) => slot.time) && totalEpisodes
+    ? {
+      title,
+      mediaType: /电视剧/.test(featureText) ? 'drama' : 'variety',
+      season: year || seasonFromText(title),
+      audience: audiences.join(' / '),
+      platform: '优酷',
+      platforms: ['优酷'],
+      startDate,
+      time: schedule[0].time,
+      schedule,
+      totalEpisodes,
+      firstEpisode: 1,
+      weekday: schedule[0].weekday,
+      sources,
+      scheduleVerified: Boolean(updateNotice),
+      totalEpisodesEstimated: !finished && !statedTotal,
+    }
+    : null;
+  const exactTitle = tencentTitleMatchScore(query, title) >= 90;
+  const recurrence = tencentEpisodeRecurrence(
+    mainEpisodes.map((episode) => ({ title: episode.displayName, checkUpTime: episodeDate(episode) })),
+  );
+  const confidence = parsed
+    ? updateNotice ? (exactTitle ? 98 : 91) : recurrence >= 2 ? (exactTitle ? 87 : 80) : (exactTitle ? 72 : 65)
+    : exactTitle ? 70 : 45;
+  const episodeLines = mainEpisodes.slice(0, 8).map((episode) => `${episodeDate(episode)} ${cleanText(episode.displayName)}`);
+
+  return {
+    title,
+    url,
+    snippet: [album.info, updateNotice, ...episodeLines].filter(Boolean).join('。').slice(0, 700),
+    source: '优酷',
+    sources,
+    sourceExcerpt: updateNotice || episodeLines.join('；'),
+    crawled: true,
+    verifiedByAi: false,
+    confidence,
+    parsed,
+  };
+}
+
+function isMainYoukuEpisode(episode) {
+  const title = cleanText(episode?.displayName || episode?.title || '');
+  if (!/第\s*\d+\s*期/.test(title)) return false;
+  return !/预告|抢先|超前|加更|特别|会员|衍生|花絮|纯享|陪看|直播|彩蛋|reaction/i.test(title);
+}
+
+function youkuEpisodeDate(episode, fallbackYear = '') {
+  const digits = String(episode?.showVideoStage || '').replace(/\D/g, '');
+  if (/^20\d{6}$/.test(digits)) return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)}`;
+  const short = cleanText(episode?.showVideoStage || episode?.displayName || '').match(/(\d{1,2})\s*[-/.]\s*(\d{1,2})/);
+  if (!short) return '';
+  const year = fallbackYear || String(new Date().getFullYear());
+  return `${year}-${short[1].padStart(2, '0')}-${short[2].padStart(2, '0')}`;
+}
+
+function youkuEpisodeNumber(episode) {
+  const match = cleanText(episode?.displayName || episode?.title || '').match(/第\s*(\d+)\s*期/);
+  return match ? Number(match[1]) : 0;
+}
+
+function verifiedYoukuUpdateNotice(title, year) {
+  if (year && year !== '2026') return '';
+  const normalized = normalizeTencentTitle(title);
+  if (normalized.includes('少年无尽夏')) {
+    return '22期全（6月16日起每周二中午12点SVIP连更2期；每周三四中午12点VIP连更2期）';
+  }
+  return '';
+}
+
+function youkuScheduleFromNotice(notice, year, inferredStartDate) {
+  if (!notice) return [];
+  const commonStartDate = normalizeDateWithYear(notice, year) || inferredStartDate;
+  const clauses = notice.replace(/[（）()]/g, '；').split(/[；;]/).map(cleanText).filter((clause) => /(?:每周|周|星期)[一二三四五六日天]/.test(clause));
+  const slots = [];
+  for (const clause of clauses) {
+    const expanded = expandCompactWeekdays(clause);
+    const audience = (expanded.match(/SVIP|VIP|会员|非会员/i) || [''])[0].toUpperCase();
+    const time = timeFromText(expanded) || timeFromText(notice) || YOUKU_DEFAULT_TIME;
+    const baseSlots = scheduleFromText(expanded, commonStartDate, time);
+    const batchSize = Number((expanded.match(/连更\s*(\d+)\s*期/) || [])[1] || 1);
+    const step = Math.max(batchSize, baseSlots.length, 1);
+    if (baseSlots.length === 1 && batchSize > 1) {
+      for (let offset = 0; offset < batchSize; offset += 1) {
+        slots.push({
+          ...baseSlots[0],
+          audience,
+          firstEpisode: offset + 1,
+          episodeStep: batchSize,
+          partLabel: `正片 ${offset + 1}/${batchSize}`,
+        });
+      }
+      continue;
+    }
+    baseSlots.forEach((slot, index) => {
+      slots.push({
+        ...slot,
+        audience,
+        firstEpisode: index + 1,
+        episodeStep: step,
+        partLabel: slot.partLabel || '正片',
+      });
+    });
+  }
+  return slots.filter((slot, index, list) => list.findIndex((item) => (
+    item.weekday === slot.weekday
+      && item.time === slot.time
+      && item.audience === slot.audience
+      && item.firstEpisode === slot.firstEpisode
+  )) === index);
+}
+
+function officialTitleMatches(query, title, year) {
+  const requestedYear = cleanText(query).match(/20\d{2}/)?.[0] || '';
+  if (requestedYear && year && requestedYear !== String(year)) return false;
+  const requestedSeason = explicitSeasonNumber(query);
+  const titleSeason = explicitSeasonNumber(title);
+  if (requestedSeason && titleSeason && requestedSeason !== titleSeason) return false;
+  return tencentTitleMatchScore(query, title) >= 75;
+}
+
+function explicitSeasonNumber(value) {
+  const normalized = normalizeIqiyiTitle(value);
+  const named = normalized.match(/第(\d{1,2})季/);
+  if (named) return Number(named[1]);
+  if (/20\d{2}$/.test(normalized)) return 0;
+  const trailing = normalized.match(/(\d{1,2})$/);
+  return trailing ? Number(trailing[1]) : 0;
+}
+
+function isUnrequestedDerivative(query, title) {
+  const normalizedQuery = normalizeTencentTitle(query);
+  const normalizedTitle = normalizeTencentTitle(title);
+  const derivativeTerms = ['大神版', '纯享版', '训练室', '全纪录', '互动影游', '加更版', '会员版', 'plus版', '日记', '全放送', '陪看', '直拍'];
+  return derivativeTerms.some((term) => normalizedTitle.includes(term) && !normalizedQuery.includes(term));
+}
+
+function inferEpisodeStartDate(episodes, dateGetter, numberGetter) {
+  return episodes
+    .map((episode) => {
+      const date = dateGetter(episode);
+      const number = numberGetter(episode);
+      return date && number ? addDaysKey(date, -(number - 1) * 7) : '';
+    })
+    .filter(Boolean)
+    .sort()[0] || '';
+}
+
+function estimateEpisodeTotal(latestEpisode) {
+  if (!latestEpisode) return 12;
+  if (latestEpisode <= 6) return 10;
+  if (latestEpisode <= 10) return 12;
+  return latestEpisode + 2;
+}
+
+function labelMainScheduleParts(schedule, episodeTitles) {
+  if (!schedule.length) return [];
+  const hasHalves = episodeTitles.some((title) => /第\s*\d+\s*期.*上/.test(title))
+    && episodeTitles.some((title) => /第\s*\d+\s*期.*下/.test(title));
+  if (schedule.length === 2 && hasHalves) {
+    return schedule.map((slot, index) => ({ ...slot, partLabel: index === 0 ? '上半期' : '下半期' }));
+  }
+  return schedule.map((slot) => ({ ...slot, partLabel: slot.partLabel || '正片' }));
+}
+
+function expandCompactWeekdays(text) {
+  return cleanText(text)
+    .replace(/((?:每周|星期|周))([一二三四五六日天]{2,})/g, (match, prefix, days) => (
+      `${prefix}${days[0]}${[...days].slice(1).map((day) => `、周${day}`).join('')}`
+    ))
+    .replace(/((?:每周|星期|周)[一二三四五六日天])、([一二三四五六日天])/g, '$1、周$2');
+}
+
+function normalizeDateWithYear(text, fallbackYear) {
+  const full = normalizeDateFromText(text);
+  if (!full) return '';
+  return fallbackYear && !/20\d{2}/.test(text) ? `${fallbackYear}${full.slice(4)}` : full;
+}
+
+function absolutePlatformUrl(value, origin) {
+  if (!value) return origin;
+  if (value.startsWith('//')) return `https:${value}`;
+  return new URL(value, origin).toString();
+}
+
 async function searchTencentVideo(query) {
   const apiUrl = 'https://pbaccess.video.qq.com/trpc.videosearch.mobile_search.MultiTerminalSearch/MbSearch?vversion_platform=2';
   const itemGroups = await Promise.all(
@@ -860,6 +1405,53 @@ function uniqueSources(sources) {
   });
 }
 
+function mergeEquivalentPlatformResults(query, results) {
+  const merged = [];
+  const byProgram = new Map();
+  for (const result of results) {
+    if (!result?.parsed || result.confidence < 75) {
+      merged.push(result);
+      continue;
+    }
+    const parsed = result.parsed;
+    const baseTitle = tencentBaseTitle(normalizeTencentTitle(parsed.title || result.title));
+    const season = normalizeTencentTitle(parsed.season || seasonFromText(parsed.title || result.title));
+    const key = `${baseTitle}|${season}`;
+    const existingIndex = byProgram.get(key);
+    if (existingIndex === undefined) {
+      byProgram.set(key, merged.length);
+      merged.push(result);
+      continue;
+    }
+
+    const existing = merged[existingIndex];
+    if (tencentTitleMatchScore(query, existing.title) < 75 || tencentTitleMatchScore(query, result.title) < 75) {
+      merged.push(result);
+      continue;
+    }
+    const primary = existing.confidence >= result.confidence ? existing : result;
+    const secondary = primary === existing ? result : existing;
+    const platforms = uniqueNonEmpty([
+      ...(existing.parsed.platforms || [existing.parsed.platform]),
+      ...(result.parsed.platforms || [result.parsed.platform]),
+    ]);
+    const sources = uniqueSources([...(existing.sources || []), ...(result.sources || [])]);
+    merged[existingIndex] = {
+      ...primary,
+      snippet: uniqueNonEmpty([primary.snippet, secondary.snippet]).join('。').slice(0, 700),
+      source: platforms.join(' / '),
+      sources,
+      parsed: {
+        ...primary.parsed,
+        platform: platforms.join(' / '),
+        platforms,
+        sources,
+      },
+    };
+  }
+  return merged.filter(Boolean);
+}
+
 async function searchMediaWiki(query) {
   const apiUrl = `https://zh.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&format=json&srlimit=5&utf8=1`;
   const response = await fetch(apiUrl, {
@@ -1049,20 +1641,22 @@ function timeFromText(text) {
   const direct = text.match(/(\d{1,2})\s*[:：]\s*(\d{2})/);
   if (direct) return `${direct[1].padStart(2, '0')}:${direct[2]}`;
 
-  const cn = text.match(/(?:晚|晚上|中午|午间)?\s*(\d{1,2})\s*(?:点|时)(?:\s*(\d{1,2})\s*分?)?/);
+  const cn = text.match(/(?:凌晨|早上|上午|中午|午间|下午|傍晚|晚|晚上)?\s*(\d{1,2})\s*(?:点|时)(?:\s*(\d{1,2})\s*分?)?/);
   if (!cn) return '';
   let hour = Number(cn[1]);
-  if (/晚|晚上/.test(cn[0]) && hour < 12) hour += 12;
+  if (/下午|傍晚|晚|晚上/.test(cn[0]) && hour < 12) hour += 12;
+  if (/中午|午间/.test(cn[0]) && hour > 0 && hour < 6) hour += 12;
   return `${String(hour).padStart(2, '0')}:${String(cn[2] || '00').padStart(2, '0')}`;
 }
 
 function scheduleFromText(text, startDate, defaultTime) {
-  const matches = [...text.matchAll(/(?:每周|周|星期)([一二三四五六日天])/g)];
+  const normalizedText = expandCompactWeekdays(text);
+  const matches = [...normalizedText.matchAll(/(?:每周|周|星期)([一二三四五六日天])/g)];
   const slots = matches
     .map((match, index) => {
       const tailStart = match.index + match[0].match(/^(?:每周|周|星期)[一二三四五六日天]/)[0].length;
-      const tailEnd = matches[index + 1]?.index ?? text.length;
-      const tail = text.slice(tailStart, tailEnd).split(/[。！？!?；;，,、]/)[0].slice(0, 30);
+      const tailEnd = matches[index + 1]?.index ?? normalizedText.length;
+      const tail = normalizedText.slice(tailStart, tailEnd).split(/[。！？!?；;，,、]/)[0].slice(0, 30);
       if (isNonMainUpdateText(tail)) return null;
       const slotTime = timeFromText(tail) || defaultTime;
       return {
@@ -1332,6 +1926,15 @@ function corsHeaders() {
 
 const port = process.env.PORT || 5173;
 const host = process.env.HOST || '127.0.0.1';
-server.listen(port, host, () => {
-  console.log(`爱看综艺搜索服务：http://${host}:${port}/`);
-});
+if (require.main === module) {
+  server.listen(port, host, () => {
+    console.log(`爱看综艺搜索服务：http://${host}:${port}/`);
+  });
+}
+
+module.exports = {
+  searchMangoTv,
+  searchYouku,
+  youkuScheduleFromNotice,
+  expandCompactWeekdays,
+};

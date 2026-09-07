@@ -546,7 +546,7 @@ function renderOnlineResult(result, index) {
       && parsed.schedule.every((slot) => /^([01]\d|2[0-3]):[0-5]\d$/.test(slot.time || "")),
   );
   const scheduleText = parsed?.schedule?.length
-    ? parsed.schedule.map((slot) => `${weekdayName(slot.weekday)} ${slot.time}${slot.partLabel ? ` · ${slot.partLabel}` : ""}`).join(" / ")
+    ? parsed.schedule.map((slot) => `${weekdayName(slot.weekday)} ${slot.time}${slot.partLabel ? ` · ${slot.partLabel}` : ""}${slot.audience ? ` · ${slot.audience}` : ""}`).join(" / ")
     : "";
   const onlinePlatformText = platformLabel(parsed || result) || result.source || "网页";
   const confidenceText = result.confidence ? ` · 置信度 ${result.confidence}` : "";
@@ -747,13 +747,23 @@ function episodeForDate(show, slot, date) {
   if (date < start || date.getDay() !== Number(slot.weekday)) return null;
 
   const weeks = Math.floor(daysBetween(start, date) / 7);
-  const episode = show.firstEpisode + weeks;
-  const lastEpisode = show.firstEpisode + show.totalEpisodes - 1;
-  return episode <= lastEpisode ? episode : null;
+  const firstEpisode = Number(slot.firstEpisode ?? show.firstEpisode ?? 1);
+  const episodeStep = Math.max(1, Number(slot.episodeStep || 1));
+  const episode = firstEpisode + weeks * episodeStep;
+  const lastEpisode = Number(show.firstEpisode || 1) + Number(show.totalEpisodes || 1) - 1;
+  const slotLastEpisode = Number(slot.lastEpisode || lastEpisode);
+  return episode <= Math.min(lastEpisode, slotLastEpisode) ? episode : null;
 }
 
 function completionText(show) {
-  const dates = scheduleForShow(show).map((slot) => addDays(parseDate(slot.startDate || show.startDate), (show.totalEpisodes - 1) * 7));
+  const showLastEpisode = Number(show.firstEpisode || 1) + Number(show.totalEpisodes || 1) - 1;
+  const dates = scheduleForShow(show).map((slot) => {
+    const firstEpisode = Number(slot.firstEpisode ?? show.firstEpisode ?? 1);
+    const episodeStep = Math.max(1, Number(slot.episodeStep || 1));
+    const lastEpisode = Math.min(showLastEpisode, Number(slot.lastEpisode || showLastEpisode));
+    const updateCount = Math.max(0, Math.floor((lastEpisode - firstEpisode) / episodeStep));
+    return addDays(parseDate(slot.startDate || show.startDate), updateCount * 7);
+  });
   const lastDate = new Date(Math.max(...dates.map((date) => date.getTime())));
   return `预计 ${toDateKey(lastDate)} 完结`;
 }
@@ -832,6 +842,9 @@ function normalizeSchedule(show) {
     startDate: slot.startDate || base.startDate,
     partLabel: slot.partLabel || "",
     audience: slot.audience || base.audience,
+    firstEpisode: Number(slot.firstEpisode ?? show.firstEpisode ?? 1),
+    episodeStep: Math.max(1, Number(slot.episodeStep || 1)),
+    lastEpisode: slot.lastEpisode ? Number(slot.lastEpisode) : undefined,
   }));
 }
 

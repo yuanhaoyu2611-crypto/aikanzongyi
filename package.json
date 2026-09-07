@@ -5,6 +5,7 @@
   "description": "手机端综艺更新时间日历应用",
   "scripts": {
     "serve": "node .static-server.cjs",
+    "test": "node --test test/*.test.cjs",
     "android:debug": "cd android && gradle assembleDebug"
   },
   "dependencies": {
