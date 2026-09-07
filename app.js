@@ -128,8 +128,11 @@ function bindEvents() {
 
   els.viewButtons.forEach((button) => {
     button.addEventListener("click", () => {
-      state.view = button.dataset.view;
-      state.cursor = state.view === "week" ? startOfWeek(state.cursor) : startOfMonth(state.cursor);
+      const nextView = button.dataset.view;
+      if (nextView === state.view) return;
+
+      state.view = nextView;
+      state.cursor = state.view === "week" ? startOfWeek(new Date()) : startOfMonth(state.cursor);
       renderCalendar();
       syncActiveButtons();
     });

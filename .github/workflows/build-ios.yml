@@ -60,12 +60,12 @@ jobs:
           mkdir -p ios/output/Payload
           cp -R ios/DerivedData/Build/Products/Release-iphoneos/App.app ios/output/Payload/
           cd ios/output
-          /usr/bin/zip -qry aikanzongyi-ios-unsigned-v1.1.ipa Payload
+          /usr/bin/zip -qry aikanzongyi-ios-unsigned-v1.1-build3.ipa Payload
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: aikanzongyi-ios-unsigned-v1.1
-          path: ios/output/aikanzongyi-ios-unsigned-v1.1.ipa
+          name: aikanzongyi-ios-unsigned-v1.1-build3
+          path: ios/output/aikanzongyi-ios-unsigned-v1.1-build3.ipa
           if-no-files-found: error
           retention-days: 30
