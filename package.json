@@ -6,9 +6,16 @@
   "scripts": {
     "serve": "node .static-server.cjs",
     "test": "node --test test/*.test.cjs",
-    "android:debug": "cd android && gradle assembleDebug"
+    "android:debug": "cd android && gradle assembleDebug",
+    "ios:add": "node scripts/sync-ios-assets.cjs && cap add ios",
+    "ios:sync": "node scripts/sync-ios-assets.cjs && cap sync ios"
   },
   "dependencies": {
+    "@capacitor/core": "^8.5.1",
+    "@capacitor/ios": "^8.5.1",
     "@jackwener/opencli": "^1.8.5"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.5.1"
   }
 }

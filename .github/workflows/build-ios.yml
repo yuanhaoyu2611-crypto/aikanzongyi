@@ -1,0 +1,71 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-ios.yml'
+      - 'app.js'
+      - 'index.html'
+      - 'styles.css'
+      - 'icon.svg'
+      - 'manifest.webmanifest'
+      - 'service-worker.js'
+      - 'capacitor.config.json'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'scripts/sync-ios-assets.cjs'
+      - 'ios/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build-unsigned-ipa:
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Sync web assets into iOS
+        run: npm run ios:sync
+
+      - name: Build unsigned device app
+        run: |
+          xcodebuild \
+            -project ios/App/App.xcodeproj \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath ios/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=''
+
+      - name: Package IPA
+        run: |
+          mkdir -p ios/output/Payload
+          cp -R ios/DerivedData/Build/Products/Release-iphoneos/App.app ios/output/Payload/
+          cd ios/output
+          /usr/bin/zip -qry aikanzongyi-ios-unsigned-v1.1.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: aikanzongyi-ios-unsigned-v1.1
+          path: ios/output/aikanzongyi-ios-unsigned-v1.1.ipa
+          if-no-files-found: error
+          retention-days: 30

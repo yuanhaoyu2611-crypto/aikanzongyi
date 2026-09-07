@@ -470,8 +470,9 @@ async function searchOnline(query) {
 }
 
 function configuredSearchEndpoint(query) {
-  const defaultFileModeBase = location.protocol === "file:" ? "https://aikanzongyi.onrender.com" : "";
-  const base = window.SEARCH_API_BASE || localStorage.getItem("aikanzongyi.searchApiBase") || defaultFileModeBase;
+  const isPackagedApp = location.protocol === "file:" || location.protocol === "capacitor:";
+  const defaultPackagedBase = isPackagedApp ? "https://aikanzongyi.onrender.com" : "";
+  const base = window.SEARCH_API_BASE || localStorage.getItem("aikanzongyi.searchApiBase") || defaultPackagedBase;
   if (!base.trim()) return "";
   return `${base.replace(/\/$/, "")}/api/search?q=${encodeURIComponent(query)}`;
 }
